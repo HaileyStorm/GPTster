@@ -9,6 +9,7 @@ from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from liger_kernel.transformers.geglu import LigerGEGLUMLP
 from liger_kernel.transformers.layer_norm import LigerLayerNorm
 import math
+from muon import Muon
 
 
 @dataclass
@@ -143,6 +144,11 @@ class GPT(nn.Module):
         self.apply(self._init_weights)
         self.criterion = LigerCrossEntropyLoss()
 
+        # Optimizers and schedulers will be set in configure_optimizers
+        self.optimizers = None
+        self.schedulers = None
+        self.get_clip_func = None
+
         # Report number of parameters
         print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
 
@@ -154,7 +160,6 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        # Have tested without this init, but not with yet!
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, LigerGEGLUMLP):
@@ -190,23 +195,79 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, device_type, betas=(0.9, 0.95)):
-        # Start with all trainable parameters
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+    def configure_optimizers(self, weight_decay, learning_rate_adamw, learning_rate_muon, device_type, get_lr_func, get_clip_func, ddp=False, ddp_rank=0, ddp_world_size=1,
+                             betas=(0.9, 0.95)):
+        # Separate parameters by optimizer
+        adamw_params = []
+        muon_params = []
 
-        # Separate parameters for weight decay
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # lm_head and wte (they share weights) go to AdamW
+        adamw_params.extend(p for p in self.lm_head.parameters() if p.requires_grad)
 
-        optim_groups = [
+        # For transformer blocks, carefully separate 2D and non-2D parameters
+        for block in self.transformer.h:
+            for name, param in block.named_parameters():
+                if param.requires_grad:
+                    if param.dim() == 2:
+                        muon_params.append(param)
+                    else:
+                        adamw_params.append(param)
+
+        # ln_f goes to AdamW (since it's 1D normalization)
+        adamw_params.extend(p for p in self.transformer.ln_f.parameters() if p.requires_grad)
+
+        # Separate AdamW parameters for weight decay
+        decay_params = [p for p in adamw_params if p.dim() >= 2]
+        nodecay_params = [p for p in adamw_params if p.dim() < 2]
+
+        adamw_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
 
-        # Check for fused optimizer support
+        # Print information about the number of parameters
+        total_params = self.get_num_params()
+        num_adamw_params = sum(p.numel() for p in adamw_params)
+        num_muon_params = sum(p.numel() for p in muon_params)
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f"Total model parameters: {total_params}")
+        print(f"AdamW parameters: {num_adamw_params} ({num_adamw_params / total_params * 100:.2f}% of total)")
+        print(f"  Decayed parameters: {num_decay_params} ({num_decay_params / total_params * 100:.2f}% of total)")
+        print(f"  Non-decayed parameters: {num_nodecay_params} ({num_nodecay_params / total_params * 100:.2f}% of total)")
+        print(f"Muon parameters: {num_muon_params} ({num_muon_params / total_params * 100:.2f}% of total)")
+
+        # Create optimizers
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == "cuda"
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
-        print(f"using fused AdamW: {use_fused}")
 
-        return optimizer
+        optimizer1 = torch.optim.AdamW(adamw_groups, lr=learning_rate_adamw, betas=betas, fused=use_fused)
+        optimizer2 = Muon(muon_params, lr=learning_rate_muon, momentum=0.95, ddp=ddp, rank=ddp_rank,
+                          world_size=ddp_world_size)
+
+        self.optimizers = [optimizer1, optimizer2]
+        self.schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda it, idx=i: get_lr_func(it)[idx])
+            for i, opt in enumerate(self.optimizers)
+        ]
+        self.get_clip_func = get_clip_func
+
+    def step(self, clip_adamw=True, clip_muon=True, skipped_last=False):
+        clip_val_adamw, clip_val_muon = self.get_clip_func()
+        norm_adamw = torch.nn.utils.clip_grad_norm_(
+            # Turns out clipping the non-decayed parameters is a bad idea
+            self.optimizers[0].param_groups[0]['params'],  # + self.optimizers[0].param_groups[1]['params'],
+            clip_val_adamw if clip_adamw else float('inf')
+        )
+        norm_muon = torch.nn.utils.clip_grad_norm_(self.optimizers[1].param_groups[0]['params'], clip_val_muon if clip_muon else float('inf'))
+
+        skip_step = norm_adamw > 20 * clip_val_adamw or norm_muon > 40 * clip_val_muon
+        skip_step = skip_step and not skipped_last
+        if not skip_step:
+            for opt, sched in zip(self.optimizers, self.schedulers):
+                opt.step()
+                sched.step()
+
+        self.zero_grad(set_to_none=True)
+        return norm_adamw.item(), norm_muon.item(), skip_step

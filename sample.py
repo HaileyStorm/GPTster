@@ -11,8 +11,8 @@ import random
 import sys
 import os
 
-checkpoint_path = './log_alibi_11_14_672/model_s90000_vl5.5817.pt'
-output_dir = './log_alibi_11_14_672/model_s90000_vl5.5817'
+checkpoint_path = './log_alibi_11_14_672_Muon_0.535x_AdamWCosine/model.pt'
+output_dir = './log_alibi_11_14_672_Muon_0.535x_AdamWCosine/model_s24985_vl5.5402'
 os.makedirs(output_dir, exist_ok=True)
 
 batch_size = 2
@@ -20,7 +20,7 @@ num_batches = 15
 # Recommend 0.045-0.055
 p_base = 0.0515
 # Recommend 0.965-0.99 (for p_base 0.045), but can get fun results up to 1.1 or more
-min_p_temp = 0.968
+min_p_temp = 0.955 #0.968
 # Generally OK ~0.9-1.01, depending on what you're after, best ~0.935-0.975, default 0.96
 top_k_temp = 0.96
 # Best 640-720, default 712
@@ -30,15 +30,16 @@ top_k_min = 360
 # Number of generated tokens to take to decrease from top_k_max to top_k_min
 # Depending on min/max, OK 512 on down to 128 or less, best ~384-416, default 408
 top_k_warmup = 408
-sampling_methods = ['top_k', 'min_p']  # ['top_k', 'min_p']
+sampling_methods = ['min_p', 'top_k']  # ['top_k', 'min_p']
 random.seed()
 seed = random.randint(0, sys.maxsize)
 
 # 3s @ 32khz = 512 tokens
 # 4.5s = 768 tokens
 # 6s = 1024
-max_length = 1440  # 6483
+max_length = 2160  # 6480, 2160...
 
+torch.set_float32_matmul_precision('high')
 device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
@@ -57,14 +58,17 @@ model_state_dict = OrderedDict([
 ])
 model.load_state_dict(model_state_dict)
 
-model.eval().to(device)
+model.to(device)
+model = torch.compile(model)
+
+model.eval()
 
 
 def min_p_sampling(logits, p_base):
     # Convert logits to probabilities
     probs = F.softmax(logits, dim=-1)
     # Get the probability of the top token
-    p_top = probs.max()
+    p_top, _ = probs.max(dim=-1, keepdim=True)
     # Calculate the dynamic threshold
     p_threshold = p_base * p_top
     # Create a mask for tokens above the threshold
@@ -87,11 +91,14 @@ def get_top_k(step):
 
 
 def normalize_audio(audio):
-    audio = audio.squeeze()  # Remove any extra dimensions
-    audio = (audio - np.min(audio)) / (np.max(audio) - np.min(audio))  # Normalize to 0-1
-    audio = (audio * 2) - 1  # Scale to -1 to 1
-    audio = (audio * 32767).astype(np.int16)  # Scale to 16-bit integer range
-    return audio
+    #audio = audio.squeeze()  # Remove any extra dimensions
+    #audio = (audio - np.min(audio)) / (np.max(audio) - np.min(audio))  # Normalize to 0-1
+    #audio = (audio * 2) - 1  # Scale to -1 to 1
+    #audio = (audio * 32767).astype(np.int16)  # Scale to 16-bit integer range
+    #return audio
+    audio = audio / np.max(np.abs(audio))
+    # Convert to 16-bit PCM
+    return (audio * 32767).astype(np.int16)
 
 
 for b in range(num_batches):

@@ -16,10 +16,9 @@ class AudioTokenizer:
 
     Output Structure:
         A flattened sequence of integers with the following structure:
-        [4097, A1, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, D6, D7, D8, A2, B3, B4, C5, C6, C7, C8, D9, D10, D11, D12, D13, D14, D15, D16, ..., A144, B287, B288, ..., 4097]
+        [A1, B1, B2, C1, C2, C3, C4, D1, D2, D3, D4, D5, D6, D7, D8, A2, B3, B4, C5, C6, C7, C8, D9, D10, D11, D12, D13, D14, D15, D16, ..., A144, B287, B288, ...]
 
         Where:
-        - 4097 is the separator token (appears at the start and end of each sequence)
         - A, B, C, and D represent values from the four SNAC tensors respectively, with offsets applied:
           - A (tensor 0): 0-4095
           - B (tensor 1): 4099-8194
@@ -73,7 +72,7 @@ class AudioTokenizer:
         num_tensors = 4 if max(flattened_output) > 12292 else 3
         tensor_lengths = [1, 2, 4, 8][:num_tensors]
         code_group_length = sum(tensor_lengths)
-        assert len(flattened_output) % code_group_length == 0, f"Input length {len(flattened_output)} is not divisible by code group length {code_group_length}; likely the model is under-trained and put a separator token where it shouldn't."
+        assert len(flattened_output) % code_group_length == 0, f"Input length {len(flattened_output)} is not divisible by code group length {code_group_length}; likely the model is under-trained (though, now that separators aren't a thing this shouldn't happen)."
 
         reconstructed = [[] for _ in range(num_tensors)]
 

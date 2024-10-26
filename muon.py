@@ -11,6 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch._inductor.config as config
+from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
@@ -75,11 +76,12 @@ class Muon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5,
-                 rank=0, world_size=1):
+                 ddp=False, rank=0, world_size=1):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
         super().__init__(params, defaults)
         self.rank = rank
         self.world_size = world_size
+        self.ddp = ddp
 
     def step(self):
 
@@ -112,7 +114,8 @@ class Muon(torch.optim.Optimizer):
                 curr_idx += p.numel()
 
             # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            if self.ddp:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             # deserialize and apply updates
             curr_idx = 0
