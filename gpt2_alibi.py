@@ -12,6 +12,22 @@ import math
 from muon import Muon
 
 
+# *****
+# Significant changes from original NanoGPT:
+# - ALiBi attention
+# - Liger GEGLU and LayerNorm (and Cross Entropy)
+# - Custom precisions
+# - Muon optimizer (OK, not part of the model) with:
+#   - 0.535x the learning rate of the AdamW optimizer
+#   - 250-step momentum warmup
+#   - Inverse square root during the "stable" phase
+# - Non-decayed AdamW params have 7.5x the learning rate of decayed parameters (already, also not part of the model)
+# - Clamping logits to +/- 30.0
+# - @Grad62304977's residual connections and Keller Jordan's embed shortcut
+# - Brendan Hogan Rappazzo's U-Net connections (maybe, 36M model did not see benefit)
+
+
+
 @dataclass
 class GPTConfig:
     # max sequence length
@@ -42,10 +58,14 @@ class GPTConfig:
     use_value_residual: bool = True
     use_learnable_lambda: bool = False
     use_embed_shortcut: bool = True
+    # Learning rate will be 1.6x (do not adjust yourself)
+    use_unet_skip: bool = False
 
     def __post_init__(self):
         if self.use_learnable_lambda and not self.use_value_residual:
             raise ValueError("Learnable Lambda requires Value Residual to be enabled")
+        if self.gradient_checkpointing and self.use_unet_skip:
+            raise ValueError("U-Net skip connections are not currently supported with gradient checkpointing")
 
 
 def get_alibi_slope(num_heads):
@@ -71,7 +91,7 @@ class ALiBiAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.c_proj.zero_init = True  # See GPT._init_weights
+        self.c_proj.zero_init = False  # See GPT._init_weights. Turned out to be a bad idea.
         # ALiBi slopes
         self.register_buffer("alibi_slope", get_alibi_slope(config.n_head))
 
@@ -164,6 +184,7 @@ class GPT(nn.Module):
         self.config = config
         self.use_value_residual = config.use_value_residual
         self.use_embed_shortcut = config.use_embed_shortcut
+        self.use_unet_skip = config.use_unet_skip
 
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -175,6 +196,14 @@ class GPT(nn.Module):
 
         # Tie the lm_head weights to the wte weights
         self.lm_head.weight = self.transformer.wte.weight
+
+        # U-Net skip connection setup
+        if self.use_unet_skip:
+            if config.n_layer % 2 != 0:
+                print("Warning: odd number of layers, last layer will not have a U-Net skip connection")
+            self.encoder_layers = config.n_layer // 2
+            self.decoder_layers = config.n_layer - self.encoder_layers
+            self.skip_weights = nn.Parameter(torch.ones(min(self.encoder_layers, self.decoder_layers)))
 
         self.apply(self._init_weights)
         self.criterion = LigerCrossEntropyLoss()
@@ -219,19 +248,37 @@ class GPT(nn.Module):
         x0 = x if self.use_embed_shortcut else None
         v1 = None
 
-        if self.config.gradient_checkpointing:
-            # Modify checkpoint_sequential to pass v1 and x0
-            def custom_forward(*inputs):
-                return checkpoint_sequential(self.transformer.h, self.config.gradient_checkpointing_num_segments,
-                                             *inputs, use_reentrant=False)
+        skip_connections = []
 
-            x = custom_forward(x, v1, x0)
+        if self.use_unet_skip:
+            # Encoder pass
+            for i in range(self.encoder_layers):
+                x = self.transformer.h[i](x, v1, x0)
+                skip_connections.append(x)
+
+            # Decoder pass with skip connections
+            for i in range(self.decoder_layers):
+                if i < len(self.skip_weights):  # Only add skip connections while we have matching encoder outputs
+                    skip_connection = skip_connections.pop()
+                    weighted_skip = self.skip_weights[i] * skip_connection
+                    x = self.transformer.h[self.encoder_layers + i](x + weighted_skip, v1, x0)
+                else:
+                    # For any extra decoder layers, just process normally
+                    x = self.transformer.h[self.encoder_layers + i](x, v1, x0)
         else:
-            for i, block in enumerate(self.transformer.h):
-                if i == 0 and self.use_value_residual:
-                    _, _, v1 = block.attn.c_attn(x).chunk(3, dim=2)
-                    v1 = v1.view(B, T, block.attn.n_head, block.attn.n_embd // block.attn.n_head).transpose(1, 2)
-                x = block(x, v1, x0)
+            # Original forward pass
+            if self.config.gradient_checkpointing:
+                def custom_forward(*inputs):
+                    return checkpoint_sequential(self.transformer.h, self.config.gradient_checkpointing_num_segments,
+                                                 *inputs, use_reentrant=False)
+
+                x = custom_forward(x, v1, x0)
+            else:
+                for i, block in enumerate(self.transformer.h):
+                    if i == 0 and self.use_value_residual:
+                        _, _, v1 = block.attn.c_attn(x).chunk(3, dim=2)
+                        v1 = v1.view(B, T, block.attn.n_head, block.attn.n_embd // block.attn.n_head).transpose(1, 2)
+                    x = block(x, v1, x0)
 
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
@@ -256,7 +303,7 @@ class GPT(nn.Module):
         muon_params = []
         residual_params = []
 
-        # Collect parameters from lm_head and wte (they share weights) for AdamW
+        # Collect parameters from lm_head / wte (they share weights) and ln_f for AdamW
         adamw_params.extend(
             [(name, p) for name, p in self.lm_head.named_parameters() if p.requires_grad]
         )
@@ -278,6 +325,11 @@ class GPT(nn.Module):
                 else:
                     # Other parameters go to AdamW
                     adamw_params.append((name, param))
+
+        if self.use_unet_skip:
+            residual_params.append(self.skip_weights)
+            learning_rate_adamw *= 1.6
+            learning_rate_muon *= 1.6
 
         # Separate AdamW parameters for weight decay
         decay_attn_params = []
@@ -311,7 +363,8 @@ class GPT(nn.Module):
         if nodecay_params:
             adamw_groups.append({
                 'params': nodecay_params,
-                'weight_decay': 0.0
+                'weight_decay': 0.0,
+                'lr': 7.5 * learning_rate_adamw
             })
         if residual_params:
             adamw_groups.append({

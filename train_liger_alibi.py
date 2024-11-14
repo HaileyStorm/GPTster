@@ -50,7 +50,8 @@ config = GPTConfig(
     logit_clamp=30.0,  # None to disable
     use_value_residual=True,
     use_learnable_lambda=True,
-    use_embed_shortcut=True
+    use_embed_shortcut=True,
+    use_unet_skip=True
 )
 
 # sequence length (note that the model does not have a block size / max sequence length - a change from the original version of this code, so there's some left-overs from that still)
