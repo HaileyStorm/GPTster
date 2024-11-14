@@ -1,27 +1,9 @@
-import os
-import sys
-import uuid
-import glob
-import time
-from dataclasses import dataclass
-
-import numpy as np
 import torch
-from torch import nn
-import torch.nn.functional as F
 import torch.distributed as dist
-import torch._inductor.config as config
-from torch.distributed import init_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-
-def zeropower_via_svd(G, steps=None):
-    U, S, V = G.svd()
-    return U @ V.T
 
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -46,9 +28,6 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     return X
 
 
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
-
-
 class Muon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -70,26 +49,36 @@ class Muon(torch.optim.Optimizer):
     Arguments:
         lr: The learning rate used by the internal SGD.
         momentum: The momentum used by the internal SGD.
+        momentum_warmup: The number of steps over which to warm up the momentum (from 0.895 of its value). 0 disables.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
-                 backend='newtonschulz5', backend_steps=5,
+    def __init__(self, params, lr=3e-4, momentum=0.95, momentum_warmup=250, nesterov=True, backend_steps=5,
                  ddp=False, rank=0, world_size=1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend_steps=backend_steps)
         super().__init__(params, defaults)
         self.rank = rank
         self.world_size = world_size
         self.ddp = ddp
+        self.momentum_warmup = momentum_warmup
+        self.it = 0
 
-    def step(self):
+    def step(self, closure=None):
+        if closure is not None:
+            with torch.enable_grad():
+                closure()
 
         for group in self.param_groups:
-
             lr = group['lr']
             momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+            momentum_warmup = self.momentum_warmup
+            if momentum_warmup > 0 and self.it <= momentum_warmup:
+                frac = min(self.it / momentum_warmup, 1.0)
+                initial = 0.895 * momentum
+                momentum = (1 - frac) * initial + frac * momentum
+                if self.it % int(round(momentum_warmup / 20)) == 0 or self.it == momentum_warmup:
+                    print(f"Muon momentum warmup ({frac * 100.0:.2f}%): {momentum:.4f}")
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in group['params'])
@@ -104,12 +93,14 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
                         state['momentum_buffer'] = torch.zeros_like(g)
+                        state['orthog_scale'] = max(g.size(0), g.size(1))**0.5
                     buf = state['momentum_buffer']
+                    scale = state['orthog_scale']
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                    g = zeropower_via_newtonschulz5(g, steps=group['backend_steps'])
+                    g *= scale # scale to have update.square().mean() == 1
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -123,3 +114,23 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
                 p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
+
+        self.it += 1
+
+    def to_cpu(self):
+        """Move optimizer state to CPU"""
+        # Move momentum buffers to CPU
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                if 'momentum_buffer' in state:
+                    state['momentum_buffer'] = state['momentum_buffer'].cpu()
+
+    def to_device(self, device):
+        """Move optimizer state to specified device"""
+        # Move momentum buffers to device
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                if 'momentum_buffer' in state:
+                    state['momentum_buffer'] = state['momentum_buffer'].to(device)

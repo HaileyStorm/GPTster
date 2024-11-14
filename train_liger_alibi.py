@@ -19,6 +19,7 @@ from scipy.io.wavfile import write
 from traceback import format_exc
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from enum import Enum, auto
+import signal
 
 # simple launch:
 # python train_gpt2.py
@@ -40,12 +41,16 @@ wandb_project = "MusicGPT-Small"
 
 # This gets overwritten (loaded from the checkpoint) if resume == True
 config = GPTConfig(
-    n_layer=6,
-    n_head=10,
-    n_embd=640,
-    dropout=0.06667,
+    n_layer=14,
+    n_head=16,
+    n_embd=704,
+    dropout=0.04,
     gradient_checkpointing=False,
-    gradient_checkpointing_num_segments=2
+    gradient_checkpointing_num_segments=2,
+    logit_clamp=30.0,  # None to disable
+    use_value_residual=True,
+    use_learnable_lambda=True,
+    use_embed_shortcut=True
 )
 
 # sequence length (note that the model does not have a block size / max sequence length - a change from the original version of this code, so there's some left-overs from that still)
@@ -58,16 +63,21 @@ inference_batch_size = 1
 assert inference_batch_size <= B
 
 weight_decay = 0.05
+# Currently not used (Muon covers all ALiBi parameters and doesn't use decay)
+weight_decay_attn = 0.05
 
 max_lr_adamw = 4.25e-4
 max_lr_muon = max_lr_adamw * 0.535
+lr_residual = 0.0025
 init_lr_pct = 0.1
 min_lr_pct = 0.015
 warmup_steps_wsd = 0
 warmup_steps_cosine = 333
+# Warmup Muon momentum value over this many steps, from 0.895x to 1x (by default, 0.85->0.95). Set to 0 to disable.
+muon_momentum_warmup = 250
 warmdown_pct_wsd = 2.0 / 7.0
 lr_func_adamw = LrFunc.Cosine
-lr_func_muon = LrFunc.WSD
+lr_func_muon = LrFunc.WSD_Inv
 
 # original (music_data_shuffled) base 2.5
 # pop2 4.77
@@ -163,9 +173,27 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 
 # Was 15-64k. In theory our goal is 610k +  (~2TB of 32khz audio if it were single epoch, or ~57.5GB tokenized [total, obviously some # epochs > 1 is fine, at least 6 & probably more w/ more data])
 max_steps = int((num_epochs * train_loader.total_tokens) // total_batch_size)
-print(f"Max steps: {max_steps}, Warmup steps: {warmup_steps_wsd}")
+print(f"Max steps: {max_steps}, Warmup steps: {max(warmup_steps_wsd, warmup_steps_cosine, muon_momentum_warmup)}")
 
 torch.set_float32_matmul_precision('high')
+
+pause_training = False
+
+
+def pause_handler(signum, frame):
+    global pause_training
+    if not pause_training:
+        if master_process:
+            print("\nPausing after current step completes...")
+        pause_training = True
+
+
+def resume_handler(signum, frame):
+    global pause_training
+    if pause_training:
+        if master_process:
+            print("\nResuming training...")
+        pause_training = False
 
 
 def get_lr_wsd(it):
@@ -285,14 +313,14 @@ def get_lrs(it):
         case LrFunc.WSD:
             muon_func = get_lr_wsd
 
-    return adamw_func(it), muon_func(it)
+    return float(adamw_func(it)), float(muon_func(it))
 
 
 def get_clip_value():
     global max_lr_adamw, max_lr_muon, total_panic_adamw, total_panic_muon, optimizer_resets_adamw, optimizer_resets_muon, norms_window_adamw, norms_window_muon, step, grad_clip_percentile, grad_clip_min_adamw, grad_clip_max_adamw, grad_clip_min_muon, grad_clip_max_muon, grad_clip_initial_adamw, grad_clip_initial_muon
 
     # AdamW clip value
-    if step < warmup_steps_wsd * 0.85 or len(norms_window_adamw) < norms_window_size:
+    if step < warmup_steps_cosine * 0.85 or len(norms_window_adamw) < norms_window_size:
         clip_val_adamw = grad_clip_initial_adamw
     else:
         clip_val_adamw = np.percentile(norms_window_adamw, grad_clip_percentile * 100)
@@ -310,8 +338,11 @@ def get_clip_value():
                 print("Too much panic: Resetting AdamW optimizer.")
                 raw_model.configure_optimizers(
                     weight_decay=weight_decay,
+                    weight_decay_attn=weight_decay_attn,
                     learning_rate_adamw=max_lr_adamw,
                     learning_rate_muon=max_lr_muon,
+                    learning_rate_residual=lr_residual,
+                    muon_momentum_warmup=muon_momentum_warmup,
                     device_type=device_type,
                     get_lr_func=get_lrs,
                     get_clip_func=get_clip_value,
@@ -355,8 +386,11 @@ def get_clip_value():
                 print("Too much panic: Resetting Muon optimizer.")
                 raw_model.configure_optimizers(
                     weight_decay=weight_decay,
+                    weight_decay_attn=weight_decay_attn,
                     learning_rate_adamw=max_lr_adamw,
                     learning_rate_muon=max_lr_muon,
+                    learning_rate_residual=lr_residual,
+                    muon_momentum_warmup=muon_momentum_warmup,
                     device_type=device_type,
                     get_lr_func=get_lrs,
                     get_clip_func=get_clip_value,
@@ -393,17 +427,6 @@ if resume:
 
 model = GPT(config)
 model.to(device)
-model.configure_optimizers(
-    weight_decay=weight_decay,
-    learning_rate_adamw=max_lr_adamw,
-    learning_rate_muon=max_lr_muon,
-    device_type=device_type,
-    get_lr_func=get_lrs,
-    get_clip_func=get_clip_value,
-    ddp=ddp,
-    ddp_rank=ddp_rank,
-    ddp_world_size=ddp_world_size
-)
 criterion = LigerCrossEntropyLoss()
 grads = None
 step = 0
@@ -421,6 +444,33 @@ if resume:
     model.load_state_dict(OrderedDict([
             (key.replace('_orig_mod.', ''), value) for key, value in chkpt['model'].items()
         ]))
+    if not reset_schedule:
+        if "step" in chkpt:
+            step = chkpt["step"]
+            muon_momentum_warmup = max(0, muon_momentum_warmup - step)
+            train_loader.skip_batches(step * grad_accum_steps)
+            # Approximate and not too important
+            val_loader.skip_batches(step * 10)
+        if "val_loss" in chkpt:
+            best_val_loss = chkpt["val_loss"]
+        if "tokens_trained" in chkpt:
+            tokens_trained = chkpt["tokens_trained"]
+        if "time_trained" in chkpt:
+            time_trained = chkpt["time_trained"]
+    model.configure_optimizers(
+        weight_decay=weight_decay,
+        weight_decay_attn=weight_decay_attn,
+        learning_rate_adamw=max_lr_adamw,
+        learning_rate_muon=max_lr_muon,
+        learning_rate_residual=lr_residual,
+        muon_momentum_warmup=muon_momentum_warmup,
+        device_type=device_type,
+        get_lr_func=get_lrs,
+        get_clip_func=get_clip_value,
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size
+    )
     if not reset_optimizer:
         for opt, opt_state in zip(model.optimizers, chkpt['optimizers']):
             opt.load_state_dict(opt_state)
@@ -436,18 +486,21 @@ if resume:
             divergence_window = chkpt["divergence_window"]
         if "grok_start_step" in chkpt:
             grok_start_step = chkpt["grok_start_step"]
-    if not reset_schedule:
-        if "step" in chkpt:
-            step = chkpt["step"]
-            train_loader.skip_batches(step * grad_accum_steps)
-            # Approximate and not too important
-            val_loader.skip_batches(step * 10)
-        if "val_loss" in chkpt:
-            best_val_loss = chkpt["val_loss"]
-        if "tokens_trained" in chkpt:
-            tokens_trained = chkpt["tokens_trained"]
-        if "time_trained" in chkpt:
-            time_trained = chkpt["time_trained"]
+else:
+    model.configure_optimizers(
+        weight_decay=weight_decay,
+        weight_decay_attn=weight_decay_attn,
+        learning_rate_adamw=max_lr_adamw,
+        learning_rate_muon=max_lr_muon,
+        learning_rate_residual=lr_residual,
+        muon_momentum_warmup=muon_momentum_warmup,
+        device_type=device_type,
+        get_lr_func=get_lrs,
+        get_clip_func=get_clip_value,
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size
+    )
 
 if use_compile:
     model = torch.compile(model)
@@ -589,6 +642,14 @@ lr_muon = b * max_lr_muon
 # create the log directory we will write checkpoints to and log to
 os.makedirs(log_dir, exist_ok=True)
 
+# Register pause/resume handlers.
+# To pause:
+#  kill -SIGUSR1 <PID>
+# To resume:
+#  kill -SIGUSR2 <PID>
+signal.signal(signal.SIGUSR1, pause_handler)
+signal.signal(signal.SIGUSR2, resume_handler)
+
 t = tqdm(range(step, max_steps), initial=step, total=max_steps, desc=f"Training epoch {current_epoch+1} of {num_epochs}", dynamic_ncols=True)
 try:
     for current_step in t:
@@ -627,7 +688,7 @@ try:
 
                 if last_step or new_epoch or step % save_every == 0 or val_loss_accum.item() < best_val_loss:
                     best_val_loss = min(best_val_loss, val_loss_accum.item())
-                    if step > warmup_steps_wsd:
+                    if step > warmup_steps_cosine:
                         # Probably these should be parameters
                         if best_val_loss < 4.99:
                             val_loss_steps = 70
@@ -691,7 +752,7 @@ try:
                 model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
             loss.backward()
 
-            if grok_enabled and step >= warmup_steps_wsd * 2:
+            if grok_enabled and step >= warmup_steps_cosine * 2:
                 if grok_start_step >= 0:
                     warmup_factor = min(1.0, (step - grok_start_step) / grok_warmup_steps) ** 3
                     alpha = grok_alpha * warmup_factor
@@ -766,6 +827,48 @@ try:
                 "etc/hours_trained": time_trained,
                 "train/loss": loss_accum.item(),
             }, step=step)
+
+        if pause_training:
+            if master_process:
+                print("Training paused. Moving model and optimizers to CPU...")
+
+            # Ensure all processes are synchronized
+            if ddp:
+                dist.barrier()
+                # Unwrap DDP
+                model = model.module
+
+            # Store current device
+            original_device = device
+            # Move model and optimizers to CPU
+            model.move_optimizers_to_cpu()
+            model = model.cpu()
+            # Clear CUDA cache
+            if 'cuda' in original_device:
+                torch.cuda.empty_cache()
+
+            if master_process:
+                print("Ready and waiting for resume...")
+
+            # Wait until resumed
+            while pause_training:
+                time.sleep(1)
+
+            if master_process:
+                print("Resuming training. Moving model and optimizers back to GPU...")
+
+            # Move model and optimizers back to original device
+            model = model.to(original_device)
+            model.move_optimizers_to_device(original_device)
+            # Rewrap in DDP if needed
+            if ddp:
+                model = DDP(model, device_ids=[ddp_local_rank])
+                # Ensure all processes are synchronized after model is moved
+                dist.barrier()
+
+            if master_process:
+                print("Model restored. Continuing training...")
+
 except KeyboardInterrupt:
     print("\nInterrupted. Saving checkpoint...")
     save_checkpoint(step, best_val_loss, f"{checkpoint_prefix}_interrupted_s{step}.pt")
