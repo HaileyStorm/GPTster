@@ -20,6 +20,8 @@ from traceback import format_exc
 from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
 from enum import Enum, auto
 import signal
+import gc
+from pyrsmi import rocml
 
 # simple launch:
 # python train_gpt2.py
@@ -76,8 +78,9 @@ warmup_steps_wsd = 0
 warmup_steps_cosine = 333
 # Warmup Muon momentum value over this many steps, from 0.895x to 1x (by default, 0.85->0.95). Set to 0 to disable.
 muon_momentum_warmup = 250
+#muon_momentum = 0.95  # Not currently passing this value to configure_optimizers
 warmdown_pct_wsd = 2.0 / 7.0
-lr_func_adamw = LrFunc.Cosine
+lr_func_adamw = LrFunc.WSD_Inv   # LrFunc.Cosine
 lr_func_muon = LrFunc.WSD_Inv
 
 # original (music_data_shuffled) base 2.5
@@ -86,10 +89,10 @@ lr_func_muon = LrFunc.WSD_Inv
 num_epochs = 21
 
 save_every = 5000 #2500
-log_dir = "log_alibi"
+log_dir = "log/alibi"
 checkpoint_prefix = "muon"  # "model"
 resume = False
-resume_from = './log_alibi/model_s7619.pt'
+resume_from = f'./{log_dir}/model_s7619.pt'
 # Whether to reset (or load from checkpoint) the optimizer. Also resets norms&loss windows.
 reset_optimizer = False
 # Whether to reset (or load from checkpoint) the schedule (the step number & therefore learning rate, best val loss, etc.)
@@ -108,6 +111,7 @@ grad_clip_min_muon = 1e-3
 grad_clip_max_muon = 2.25
 norms_window_size = 250
 # Decrease lr when norm percentile & loss are increasing
+enable_panic = False
 max_clip_slope = 1.1
 lr_adj_rate = 0.925  # effectively, max_lr = max_lr * lr_adj_rate every norms_window_size/3 steps while conditions met
 
@@ -197,6 +201,23 @@ def resume_handler(signum, frame):
         pause_training = False
 
 
+def configure_optimizers(model: torch.nn.Module):
+    model.configure_optimizers(
+        weight_decay=weight_decay,
+        weight_decay_attn=weight_decay_attn,
+        learning_rate_adamw=max_lr_adamw,
+        learning_rate_muon=max_lr_muon,
+        learning_rate_residual=lr_residual,
+        muon_momentum_warmup=muon_momentum_warmup,
+        device_type=device_type,
+        get_lr_func=get_lrs,
+        get_clip_func=get_clip_value,
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+    )
+
+
 def get_lr_wsd(it):
     """
     WSD learning rate schedule.
@@ -247,7 +268,7 @@ def get_lr_wsd_inv(it):
     # Calculate start of warmdown
     warmdown_start = max_steps * (1 - warmdown_pct_wsd)
 
-    # Stable phase with inverse square root decay from 1.0 to 0.85
+    # ~Stable phase with inverse square root decay from 1.0 to 0.85
     if it < warmdown_start:
         # Progress between warmup and warmdown
         progress = (it - warmup_steps_wsd) / (warmdown_start - warmup_steps_wsd)
@@ -325,46 +346,34 @@ def get_clip_value():
         clip_val_adamw = grad_clip_initial_adamw
     else:
         clip_val_adamw = np.percentile(norms_window_adamw, grad_clip_percentile * 100)
-        third = norms_window_size // 3
-        p1_adamw = np.percentile(norms_window_adamw[:third], grad_clip_percentile * 100)
-        p2_adamw = np.percentile(norms_window_adamw[third:2*third], grad_clip_percentile * 100)
-        p3_adamw = np.percentile(norms_window_adamw[2*third:], grad_clip_percentile * 100)
-        l1_adamw = np.mean(loss_window[:third])
-        l2_adamw = np.mean(loss_window[third:2*third])
-        l3_adamw = np.mean(loss_window[2*third:])
-        if p3_adamw > p2_adamw > p1_adamw and p3_adamw / p2_adamw > max_clip_slope and p2_adamw / p1_adamw > max_clip_slope and l3_adamw > l2_adamw > l1_adamw:
-            max_lr_adamw *= lr_adj_rate ** (3 / norms_window_size)
-            total_panic_adamw += 1
-            if total_panic_adamw % (third * 2) == 0:
-                print("Too much panic: Resetting AdamW optimizer.")
-                raw_model.configure_optimizers(
-                    weight_decay=weight_decay,
-                    weight_decay_attn=weight_decay_attn,
-                    learning_rate_adamw=max_lr_adamw,
-                    learning_rate_muon=max_lr_muon,
-                    learning_rate_residual=lr_residual,
-                    muon_momentum_warmup=muon_momentum_warmup,
-                    device_type=device_type,
-                    get_lr_func=get_lrs,
-                    get_clip_func=get_clip_value,
-                    ddp=ddp,
-                    ddp_rank=ddp_rank,
-                    ddp_world_size=ddp_world_size
-                )
-                optimizer_resets_adamw += 1
-            wandb.log({
-                "debug/panic_adamw": 1.0,
-                "debug/total_panic_adamw": total_panic_adamw,
-                "debug/max_lr_adamw": max_lr_adamw,
-                "debug/optimizer_resets_adamw": optimizer_resets_adamw,
-            }, step=step)
-        else:
-            wandb.log({
-                "debug/panic_adamw": 0.0,
-                "debug/total_panic_adamw": total_panic_adamw,
-                "debug/max_lr_adamw": max_lr_adamw,
-                "debug/optimizer_resets_adamw": optimizer_resets_adamw,
-            }, step=step)
+        if enable_panic:
+            third = norms_window_size // 3
+            p1_adamw = np.percentile(norms_window_adamw[:third], grad_clip_percentile * 100)
+            p2_adamw = np.percentile(norms_window_adamw[third:2*third], grad_clip_percentile * 100)
+            p3_adamw = np.percentile(norms_window_adamw[2*third:], grad_clip_percentile * 100)
+            l1_adamw = np.mean(loss_window[:third])
+            l2_adamw = np.mean(loss_window[third:2*third])
+            l3_adamw = np.mean(loss_window[2*third:])
+            if p3_adamw > p2_adamw > p1_adamw and p3_adamw / p2_adamw > max_clip_slope and p2_adamw / p1_adamw > max_clip_slope and l3_adamw > l2_adamw > l1_adamw:
+                max_lr_adamw *= lr_adj_rate ** (3 / norms_window_size)
+                total_panic_adamw += 1
+                if total_panic_adamw % (third * 2) == 0:
+                    print("Too much panic: Resetting AdamW optimizer.")
+                    configure_optimizers(raw_model)
+                    optimizer_resets_adamw += 1
+                wandb.log({
+                    "debug/panic_adamw": 1.0,
+                    "debug/total_panic_adamw": total_panic_adamw,
+                    "debug/max_lr_adamw": max_lr_adamw,
+                    "debug/optimizer_resets_adamw": optimizer_resets_adamw,
+                }, step=step)
+            else:
+                wandb.log({
+                    "debug/panic_adamw": 0.0,
+                    "debug/total_panic_adamw": total_panic_adamw,
+                    "debug/max_lr_adamw": max_lr_adamw,
+                    "debug/optimizer_resets_adamw": optimizer_resets_adamw,
+                }, step=step)
 
         clip_val_adamw = max(grad_clip_min_adamw, min(grad_clip_max_adamw, clip_val_adamw))
 
@@ -373,46 +382,34 @@ def get_clip_value():
         clip_val_muon = grad_clip_initial_muon
     else:
         clip_val_muon = np.percentile(norms_window_muon, grad_clip_percentile * 100)
-        third = norms_window_size // 3
-        p1_muon = np.percentile(norms_window_muon[:third], grad_clip_percentile * 100)
-        p2_muon = np.percentile(norms_window_muon[third:2*third], grad_clip_percentile * 100)
-        p3_muon = np.percentile(norms_window_muon[2*third:], grad_clip_percentile * 100)
-        l1_muon = np.mean(loss_window[:third])
-        l2_muon = np.mean(loss_window[third:2*third])
-        l3_muon = np.mean(loss_window[2*third:])
-        if p3_muon > p2_muon > p1_muon and p3_muon / p2_muon > max_clip_slope and p2_muon / p1_muon > max_clip_slope and l3_muon > l2_muon > l1_muon:
-            max_lr_muon *= lr_adj_rate ** (3 / norms_window_size)
-            total_panic_muon += 1
-            if total_panic_muon % (third * 2) == 0:
-                print("Too much panic: Resetting Muon optimizer.")
-                raw_model.configure_optimizers(
-                    weight_decay=weight_decay,
-                    weight_decay_attn=weight_decay_attn,
-                    learning_rate_adamw=max_lr_adamw,
-                    learning_rate_muon=max_lr_muon,
-                    learning_rate_residual=lr_residual,
-                    muon_momentum_warmup=muon_momentum_warmup,
-                    device_type=device_type,
-                    get_lr_func=get_lrs,
-                    get_clip_func=get_clip_value,
-                    ddp=ddp,
-                    ddp_rank=ddp_rank,
-                    ddp_world_size=ddp_world_size
-                )
-                optimizer_resets_muon += 1
-            wandb.log({
-                "debug/panic_muon": 1.0,
-                "debug/total_panic_muon": total_panic_muon,
-                "debug/max_lr_muon": max_lr_muon,
-                "debug/optimizer_resets_muon": optimizer_resets_muon,
-            }, step=step)
-        else:
-            wandb.log({
-                "debug/panic_muon": 0.0,
-                "debug/total_panic_muon": total_panic_muon,
-                "debug/max_lr_muon": max_lr_muon,
-                "debug/optimizer_resets_muon": optimizer_resets_muon,
-            }, step=step)
+        if enable_panic:
+            third = norms_window_size // 3
+            p1_muon = np.percentile(norms_window_muon[:third], grad_clip_percentile * 100)
+            p2_muon = np.percentile(norms_window_muon[third:2*third], grad_clip_percentile * 100)
+            p3_muon = np.percentile(norms_window_muon[2*third:], grad_clip_percentile * 100)
+            l1_muon = np.mean(loss_window[:third])
+            l2_muon = np.mean(loss_window[third:2*third])
+            l3_muon = np.mean(loss_window[2*third:])
+            if p3_muon > p2_muon > p1_muon and p3_muon / p2_muon > max_clip_slope and p2_muon / p1_muon > max_clip_slope and l3_muon > l2_muon > l1_muon:
+                max_lr_muon *= lr_adj_rate ** (3 / norms_window_size)
+                total_panic_muon += 1
+                if total_panic_muon % (third * 2) == 0:
+                    print("Too much panic: Resetting Muon optimizer.")
+                    configure_optimizers(raw_model)
+                    optimizer_resets_muon += 1
+                wandb.log({
+                    "debug/panic_muon": 1.0,
+                    "debug/total_panic_muon": total_panic_muon,
+                    "debug/max_lr_muon": max_lr_muon,
+                    "debug/optimizer_resets_muon": optimizer_resets_muon,
+                }, step=step)
+            else:
+                wandb.log({
+                    "debug/panic_muon": 0.0,
+                    "debug/total_panic_muon": total_panic_muon,
+                    "debug/max_lr_muon": max_lr_muon,
+                    "debug/optimizer_resets_muon": optimizer_resets_muon,
+                }, step=step)
 
         clip_val_muon = max(grad_clip_min_muon, min(grad_clip_max_muon, clip_val_muon))
 
@@ -423,7 +420,7 @@ def get_clip_value():
 chkpt = None
 if resume:
     print(f"Resuming from {resume_from}")
-    chkpt = torch.load(resume_from, map_location=torch.device('cpu'))
+    chkpt = torch.load(resume_from, map_location=torch.device('cpu'), weights_only=False)
     config: GPTConfig = chkpt["config"]
 
 model = GPT(config)
@@ -448,7 +445,6 @@ if resume:
     if not reset_schedule:
         if "step" in chkpt:
             step = chkpt["step"]
-            muon_momentum_warmup = max(0, muon_momentum_warmup - step)
             train_loader.skip_batches(step * grad_accum_steps)
             # Approximate and not too important
             val_loader.skip_batches(step * 10)
@@ -458,20 +454,7 @@ if resume:
             tokens_trained = chkpt["tokens_trained"]
         if "time_trained" in chkpt:
             time_trained = chkpt["time_trained"]
-    model.configure_optimizers(
-        weight_decay=weight_decay,
-        weight_decay_attn=weight_decay_attn,
-        learning_rate_adamw=max_lr_adamw,
-        learning_rate_muon=max_lr_muon,
-        learning_rate_residual=lr_residual,
-        muon_momentum_warmup=muon_momentum_warmup,
-        device_type=device_type,
-        get_lr_func=get_lrs,
-        get_clip_func=get_clip_value,
-        ddp=ddp,
-        ddp_rank=ddp_rank,
-        ddp_world_size=ddp_world_size
-    )
+    configure_optimizers(model)
     if not reset_optimizer:
         for opt, opt_state in zip(model.optimizers, chkpt['optimizers']):
             opt.load_state_dict(opt_state)
@@ -488,20 +471,7 @@ if resume:
         if "grok_start_step" in chkpt:
             grok_start_step = chkpt["grok_start_step"]
 else:
-    model.configure_optimizers(
-        weight_decay=weight_decay,
-        weight_decay_attn=weight_decay_attn,
-        learning_rate_adamw=max_lr_adamw,
-        learning_rate_muon=max_lr_muon,
-        learning_rate_residual=lr_residual,
-        muon_momentum_warmup=muon_momentum_warmup,
-        device_type=device_type,
-        get_lr_func=get_lrs,
-        get_clip_func=get_clip_value,
-        ddp=ddp,
-        ddp_rank=ddp_rank,
-        ddp_world_size=ddp_world_size
-    )
+    configure_optimizers(model)
 
 if use_compile:
     model = torch.compile(model)
@@ -624,6 +594,7 @@ def save_checkpoint(step, val_loss, checkpoint_name, final=False):
         }
         torch.save(checkpoint, checkpoint_path)
         print("Done.")
+    del checkpoint
 
 
 eval_every = 100 #50  # Gets changed below
@@ -650,6 +621,8 @@ os.makedirs(log_dir, exist_ok=True)
 #  kill -SIGUSR2 <PID>
 signal.signal(signal.SIGUSR1, pause_handler)
 signal.signal(signal.SIGUSR2, resume_handler)
+
+rocml.smi_initialize()
 
 t = tqdm(range(step, max_steps), initial=step, total=max_steps, desc=f"Training epoch {current_epoch+1} of {num_epochs}", dynamic_ncols=True)
 try:
@@ -716,6 +689,7 @@ try:
 
                                 model.eval()
                                 with torch.no_grad():
+                                    # Full sequence (prefilling from dataset to come later)
                                     try:
                                         print("\n\tFull sequence...")
                                         full_tokens = generate_tokens(model, T, inference_batch_size)
@@ -774,7 +748,7 @@ try:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
         clip_val_adamw, clip_val_muon = get_clip_value()
-        norm_adamw, norm_muon, skipped = model.step(clip_adamw=clip_adamw, clip_muon=clip_muon,skipped_last=skipped_last)
+        norm_adamw, norm_muon, skipped = model.step(step, clip_adamw=clip_adamw, clip_muon=clip_muon,skipped_last=skipped_last)
         if skipped:
             print(f"Skipping step {step} due to high gradient norm: {norm_adamw:.4f} (AdamW), {norm_muon:.4f} (Muon)")
             skipped_steps += 1
@@ -828,6 +802,15 @@ try:
                 "etc/hours_trained": time_trained,
                 "train/loss": loss_accum.item(),
             }, step=step)
+            if step % 10 == 0:
+                vram_used = rocml.smi_get_device_memory_used(0) / 1024 ** 3  # Convert to GB
+                memory_busy = rocml.smi_get_device_memory_busy(0)
+                avg_power = rocml.smi_get_device_average_power(0)
+                wandb.log({
+                    "gpu/VRAM": vram_used,
+                    "gpu/MemBusy": memory_busy,
+                    "gpu/AvgPower": avg_power,
+                }, step=step)
 
         if pause_training:
             if master_process:
@@ -870,9 +853,15 @@ try:
             if master_process:
                 print("Model restored. Continuing training...")
 
+        #if 'cuda' in device and step % 20 == 0:
+        #    del x, y, loss, loss_accum
+        #    gc.collect()
+        #    torch.cuda.empty_cache()
+
 except KeyboardInterrupt:
     print("\nInterrupted. Saving checkpoint...")
     save_checkpoint(step, best_val_loss, f"{checkpoint_prefix}_interrupted_s{step}.pt")
 
+rocml.smi_shutdown()
 if ddp:
     destroy_process_group()

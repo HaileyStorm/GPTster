@@ -10,7 +10,7 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
     assert len(G.shape) == 2
@@ -54,15 +54,13 @@ class Muon(torch.optim.Optimizer):
         backend: The chosen backend for the orthogonalization step. (recommended: 'newtonschulz5')
         backend_steps: The number of iteration steps to use in the backend, if it is iterative.
     """
-    def __init__(self, params, lr=3e-4, momentum=0.95, momentum_warmup=250, nesterov=True, backend_steps=5,
+    def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True, backend_steps=5,
                  ddp=False, rank=0, world_size=1):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend_steps=backend_steps)
         super().__init__(params, defaults)
         self.rank = rank
         self.world_size = world_size
         self.ddp = ddp
-        self.momentum_warmup = momentum_warmup
-        self.it = 0
 
     def step(self, closure=None):
         if closure is not None:
@@ -72,13 +70,6 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group['lr']
             momentum = group['momentum']
-            momentum_warmup = self.momentum_warmup
-            if momentum_warmup > 0 and self.it <= momentum_warmup:
-                frac = min(self.it / momentum_warmup, 1.0)
-                initial = 0.895 * momentum
-                momentum = (1 - frac) * initial + frac * momentum
-                if self.it % int(round(momentum_warmup / 20)) == 0 or self.it == momentum_warmup:
-                    print(f"Muon momentum warmup ({frac * 100.0:.2f}%): {momentum:.4f}")
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in group['params'])
@@ -114,8 +105,7 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[curr_idx:curr_idx+p.numel()].view_as(p.data).type_as(p.data)
                 p.data.add_(g, alpha=-lr)
                 curr_idx += p.numel()
-
-        self.it += 1
+        del updates_flat
 
     def to_cpu(self):
         """Move optimizer state to CPU"""

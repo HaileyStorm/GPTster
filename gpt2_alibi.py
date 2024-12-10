@@ -2,6 +2,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import wandb
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint_sequential
 import inspect
@@ -31,16 +32,18 @@ from muon import Muon
 @dataclass
 class GPTConfig:
     # max sequence length
-    vocab_size: int = 16389
+    vocab_size: int = 16640 #16389
 
     # MUSIC
     # 9/10/640 = 47.38M, fails (needs more attention heads? second guess depth too low, then unlikely but width too high / too high for depth)
     # 11/12/576 = 45.86M, works.
     # 8/16/640 = 43.28M, works, initially faster, more stable, but "final" loss ~3.9% lower.
     # 8/12/576 = 36M, works, at least short training (all I've tested).
-    # *11/14/672 = 60.72M
+    # 7/11/528 = 28.32M, fails, even short training
+    # 7/12/576 = 32.83M, works short training
+    # *11/14/672 = 60.72M, most tested (well, 36M has had much more, but all short)
     # *Try 14/16/704 (possibly 13 layers depending max ctx)
-    n_layer: int = 8 #11
+    n_layer: int = 7 #8 #11
     n_head: int = 12 #14
     n_embd: int = 576 #672
     dropout: float = 0.04
@@ -85,7 +88,7 @@ class ALiBiAttention(nn.Module):
         self.use_value_residual = config.use_value_residual
         self.use_learnable_lambda = config.use_learnable_lambda
         if self.use_learnable_lambda:
-            self.lambda_param = nn.Parameter(torch.tensor(0.5))
+            self.lambda_param = nn.Parameter(torch.tensor(0.75))
 
         # Key, Query, Value projections
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -157,7 +160,7 @@ class Block(nn.Module):
 
         self.use_embed_shortcut = config.use_embed_shortcut
         if self.use_embed_shortcut:
-            self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
+            self.lambdas = nn.Parameter(torch.tensor([1., 0.25]))
 
         self.ln_1 = LigerLayerNorm(config.n_embd, eps=1e-5)
         self.ln_2 = LigerLayerNorm(config.n_embd, eps=1e-5)
@@ -203,7 +206,12 @@ class GPT(nn.Module):
                 print("Warning: odd number of layers, last layer will not have a U-Net skip connection")
             self.encoder_layers = config.n_layer // 2
             self.decoder_layers = config.n_layer - self.encoder_layers
-            self.skip_weights = nn.Parameter(torch.ones(min(self.encoder_layers, self.decoder_layers)))
+            self.skip_weights = nn.Parameter(torch.full((min(self.encoder_layers, self.decoder_layers),), 0.25))
+
+        # Muon momentum, values will be set in configure_optimizers
+        self.register_buffer("muon_momentum", torch.tensor(0.95))
+        self.muon_momentum_warmup = 0
+        self.muon_momentum_sp = 0.95
 
         self.apply(self._init_weights)
         self.criterion = LigerCrossEntropyLoss()
@@ -212,6 +220,7 @@ class GPT(nn.Module):
         self.optimizers = None
         self.schedulers = None
         self.get_clip_func = None
+        self.steps_since_reset = 0
 
         # Report number of parameters
         print(f"number of parameters: {self.get_num_params() / 1e6:.2f}M")
@@ -242,8 +251,6 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(module.bias)
 
     def forward(self, idx, targets=None):
-        B, T = idx.size()
-
         x = self.transformer.wte(idx).to(torch.bfloat16)  # (B, T, C)
         x0 = x if self.use_embed_shortcut else None
         v1 = None
@@ -275,9 +282,10 @@ class GPT(nn.Module):
                 x = custom_forward(x, v1, x0)
             else:
                 for i, block in enumerate(self.transformer.h):
-                    if i == 0 and self.use_value_residual:
-                        _, _, v1 = block.attn.c_attn(x).chunk(3, dim=2)
-                        v1 = v1.view(B, T, block.attn.n_head, block.attn.n_embd // block.attn.n_head).transpose(1, 2)
+                    # ALiBi forward handles this
+                    #if i == 0 and self.use_value_residual:
+                    #    _, _, v1 = block.attn.c_attn(x).chunk(3, dim=2)
+                    #    v1 = v1.view(B, T, block.attn.n_head, block.attn.n_embd // block.attn.n_head).transpose(1, 2)
                     x = block(x, v1, x0)
 
         x = self.transformer.ln_f(x)
@@ -296,23 +304,34 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, weight_decay_attn, learning_rate_adamw, learning_rate_muon, learning_rate_residual, muon_momentum_warmup, device_type, get_lr_func, get_clip_func, ddp=False, ddp_rank=0, ddp_world_size=1,
-                             betas=(0.9, 0.95)):
+    def configure_optimizers(self, weight_decay, weight_decay_attn, learning_rate_adamw, learning_rate_muon,
+                             learning_rate_residual, muon_momentum_warmup, device_type, get_lr_func, get_clip_func,
+                             ddp=False, ddp_rank=0, ddp_world_size=1,
+                             betas=(0.9, 0.95), muon_momentum=0.95):
+
+        # Update Muon momentum values, see GPT.step
+        self.muon_momentum_warmup = muon_momentum_warmup
+        self.muon_momentum = torch.tensor(muon_momentum)
+        self.muon_momentum_sp = muon_momentum
+
         # Separate parameters by optimizer
         adamw_params = []
-        muon_params = []
+        muon_params_by_layer = [[] for _ in range(len(self.transformer.h))]  # Doing this instead of a single group is an artifact of a failed experiment
         residual_params = []
 
         # Collect parameters from lm_head / wte (they share weights) and ln_f for AdamW
-        adamw_params.extend(
-            [(name, p) for name, p in self.lm_head.named_parameters() if p.requires_grad]
-        )
+        #adamw_params.extend(
+        #    [(name, p) for name, p in self.lm_head.named_parameters() if p.requires_grad]
+        #)
+        wte_params = [
+            (name, p) for name, p in self.transformer.wte.named_parameters() if p.requires_grad
+        ]
         adamw_params.extend(
             [(name, p) for name, p in self.transformer.ln_f.named_parameters() if p.requires_grad]
         )
 
         # Collect parameters from transformer blocks
-        for block in self.transformer.h:
+        for i, block in enumerate(self.transformer.h):
             for name, param in block.named_parameters():
                 if not param.requires_grad:
                     continue
@@ -321,7 +340,7 @@ class GPT(nn.Module):
                     residual_params.append(param)
                 elif param.dim() == 2:
                     # Parameters with dim==2 are assigned to Muon optimizer
-                    muon_params.append(param)
+                    muon_params_by_layer[i].append(param)
                 else:
                     # Other parameters go to AdamW
                     adamw_params.append((name, param))
@@ -364,14 +383,26 @@ class GPT(nn.Module):
             adamw_groups.append({
                 'params': nodecay_params,
                 'weight_decay': 0.0,
-                'lr': 7.5 * learning_rate_adamw
+                'lr': learning_rate_adamw * 7.5
+            })
+        if wte_params:
+            adamw_groups.append({
+                'params': [p for _, p in wte_params],
+                'weight_decay': weight_decay,
+                'lr': learning_rate_adamw * 2.5
             })
         if residual_params:
             adamw_groups.append({
                 'params': residual_params,
                 'weight_decay': 0.0,
-                'lr': learning_rate_residual   # Separate learning rate for residual parameters
+                'lr': learning_rate_residual
             })
+        muon_groups = [
+            {'params': layer_params,
+             'momentum': muon_momentum
+             }
+            for i, layer_params in enumerate(muon_params_by_layer)
+        ]
 
         # Print information about the number of parameters
         total_params = self.get_num_params()
@@ -380,7 +411,7 @@ class GPT(nn.Module):
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
         num_residual_params = sum(p.numel() for p in residual_params)
         num_adamw_params = num_decay_attn_params + num_decay_other_params + num_nodecay_params + num_residual_params
-        num_muon_params = sum(p.numel() for p in muon_params)
+        num_muon_params = sum(param.numel() for layer_params in muon_params_by_layer for param in layer_params)
 
         print(f"Total model parameters: {total_params}")
         print(f"AdamW parameters: {num_adamw_params} ({num_adamw_params / total_params * 100:.2f}% of total)")
@@ -395,15 +426,79 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == "cuda"
 
         optimizer1 = torch.optim.AdamW(adamw_groups, lr=learning_rate_adamw, betas=betas, fused=use_fused)
-        optimizer2 = Muon(muon_params, lr=learning_rate_muon, momentum=0.95, momentum_warmup=muon_momentum_warmup, ddp=ddp, rank=ddp_rank,
-                          world_size=ddp_world_size)
+        optimizer2 = Muon(muon_groups, lr=learning_rate_muon, momentum=muon_momentum,
+                          ddp=ddp, rank=ddp_rank, world_size=ddp_world_size)
 
         self.optimizers = [optimizer1, optimizer2]
         self.schedulers = [
-            torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lambda it, idx=i: get_lr_func(it)[idx])
+            torch.optim.lr_scheduler.LambdaLR(opt if isinstance(opt, torch.optim.Optimizer) else opt.base, lr_lambda=lambda it, idx=i: get_lr_func(it)[idx])
             for i, opt in enumerate(self.optimizers)
         ]
         self.get_clip_func = get_clip_func
+        self.steps_since_reset = 0
+
+    def step(self, current_step, clip_adamw=True, clip_muon=True, skipped_last=False):
+        clip_val_adamw, clip_val_muon = self.get_clip_func()
+
+        norm_adamw = torch.nn.utils.clip_grad_norm_(
+            # Turns out clipping the non-decayed parameters is a bad idea
+            self.optimizers[0].param_groups[0]['params'],  # + self.optimizers[0].param_groups[1]['params'],
+            clip_val_adamw if clip_adamw else float('inf')
+        )
+        norm_muon = torch.nn.utils.clip_grad_norm_(self.optimizers[1].param_groups[0]['params'], clip_val_muon if clip_muon else float('inf'))
+
+        # Apply Muon momentum warmup
+        if self.muon_momentum_warmup > 0 and current_step <= self.muon_momentum_warmup:
+            frac = min(current_step / self.muon_momentum_warmup, 1.0)
+            initial = 0.895 * self.muon_momentum.item()
+            current_momentum = (1 - frac) * initial + frac * self.muon_momentum.item()
+        else:
+            current_momentum = self.muon_momentum.item()
+
+        # Dynamic momentum
+        if current_step == self.muon_momentum_warmup * 10:
+            print(f"Starting dynamic Muon momentum.")
+        if current_step >= self.muon_momentum_warmup * 10 and self.steps_since_reset > max(self.muon_momentum_warmup, 250):
+            # This magic number is trying to adjust for the fact the clip val is nth percentile of norm.
+            # The goal is for norm_ratio to be 1.0 on average (or very slightly higher).
+            norm_ratio = (norm_muon * 0.9125) / clip_val_muon
+            # The rest of the magic numbers are based on ablations and vibes.
+            norm_factor = max(0.9825, min(1.0475, norm_ratio ** 0.1375))  # Best with clip target: .9825, 1.05, 0.3. Best without: 9825, 1.0475, 0.1375 + max 0.99
+            current_momentum *= norm_factor
+            momentum_min = 0.9 * self.muon_momentum_sp
+            momentum_max = 0.99
+            current_momentum = max(momentum_min, min(momentum_max, current_momentum))
+            wandb.log({
+                "etc/muon_norm_ratio": norm_ratio,
+                "etc/muon_norm_factor": norm_factor,
+            }, step=current_step)
+
+            # "Smoothing": We move the current step momentum a bit toward the base momentum, and vice versa. The base is
+            # anchored to the set-point (initial value of the parameter provided in `configure_optimizers`).
+            # (OK, smoothing is a bad word choice - in practice the result is higher variability in step-to-step momentum)
+            new_base_momentum = (self.muon_momentum_sp * 4.0 + current_momentum + self.muon_momentum.item()) / 6.0
+            current_momentum = (current_momentum * 5.0 + self.muon_momentum.item()) / 6.0
+            current_momentum = max(momentum_min, min(momentum_max, current_momentum))
+            self.muon_momentum = torch.tensor(max(momentum_min, min(momentum_max, new_base_momentum)))
+
+        # Update Muon optimizer's momentum
+        for group in self.optimizers[1].param_groups:
+            group['momentum'] = current_momentum
+        wandb.log({
+            "etc/muon_momentum": current_momentum,
+            "etc/muon_momentum_base": self.muon_momentum.item(),
+        }, step=current_step)
+
+        skip_step = norm_adamw > 20.0 * clip_val_adamw or norm_muon > 40.0 * clip_val_muon
+        skip_step = skip_step and not skipped_last and current_step > max(self.muon_momentum_warmup * 2, 500) and self.steps_since_reset > max(self.muon_momentum_warmup, 250)
+        if not skip_step:
+            for opt, sched in zip(self.optimizers, self.schedulers):
+                opt.step()
+                sched.step()
+
+        self.zero_grad(set_to_none=True)
+        self.steps_since_reset += 1
+        return norm_adamw.item(), norm_muon.item(), skip_step
 
     def move_optimizers_to_cpu(self):
         """Move optimizer states to CPU"""
@@ -426,22 +521,3 @@ class GPT(nn.Module):
             # For Muon optimizer specifically (if it has device-specific attributes)
             if hasattr(opt, 'to_device'):
                 opt.to_device(device)
-
-    def step(self, clip_adamw=True, clip_muon=True, skipped_last=False):
-        clip_val_adamw, clip_val_muon = self.get_clip_func()
-        norm_adamw = torch.nn.utils.clip_grad_norm_(
-            # Turns out clipping the non-decayed parameters is a bad idea
-            self.optimizers[0].param_groups[0]['params'],  # + self.optimizers[0].param_groups[1]['params'],
-            clip_val_adamw if clip_adamw else float('inf')
-        )
-        norm_muon = torch.nn.utils.clip_grad_norm_(self.optimizers[1].param_groups[0]['params'], clip_val_muon if clip_muon else float('inf'))
-
-        skip_step = norm_adamw > 20 * clip_val_adamw or norm_muon > 40 * clip_val_muon
-        skip_step = skip_step and not skipped_last
-        if not skip_step:
-            for opt, sched in zip(self.optimizers, self.schedulers):
-                opt.step()
-                sched.step()
-
-        self.zero_grad(set_to_none=True)
-        return norm_adamw.item(), norm_muon.item(), skip_step
